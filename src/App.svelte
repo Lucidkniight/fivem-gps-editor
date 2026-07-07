@@ -65,6 +65,10 @@
 
   let showClearConfirm = false;
 
+  let showNormalizeModal = false;
+  let normalizeSpacing = 30;
+  let normalizeStats = { count: 0, avg: 0, min: 0, max: 0 };
+
   let showMapMenu = false;
   let showColorMenu = false;
 
@@ -261,6 +265,75 @@
     showClearConfirm = false;
   }
 
+  // ================= NORMALIZE SPACING =================
+  function computePathStats(points) {
+    if (points.length < 2) return { count: points.length, avg: 0, min: 0, max: 0 };
+
+    let total = 0, min = Infinity, max = 0;
+
+    for (let i = 1; i < points.length; i++) {
+      const dx = points[i].x - points[i - 1].x;
+      const dy = points[i].y - points[i - 1].y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+
+      total += d;
+      min = Math.min(min, d);
+      max = Math.max(max, d);
+    }
+
+    return { count: points.length, avg: total / (points.length - 1), min, max };
+  }
+
+  function openNormalizeModal() {
+    if (pathPoints.length < 2) return;
+
+    normalizeStats = computePathStats(pathPoints.map((p) => mapToGta(p.x, p.y)));
+    normalizeSpacing = normalizeStats.avg > 0 ? Math.round(normalizeStats.avg) : 30;
+    showNormalizeModal = true;
+  }
+
+  function closeNormalizeModal() {
+    showNormalizeModal = false;
+  }
+
+  // splits any segment longer than `spacing` into evenly sized sub-segments,
+  // inserting extra points along the way; existing points are never removed
+  // or moved, so actual spacing may end up shorter than the target in places
+  function densifyPoints(points, spacing) {
+    if (points.length < 2 || spacing <= 0) return points;
+
+    const result = [points[0]];
+
+    for (let i = 1; i < points.length; i++) {
+      const prev = points[i - 1];
+      const curr = points[i];
+      const dx = curr.x - prev.x;
+      const dy = curr.y - prev.y;
+      const segLen = Math.sqrt(dx * dx + dy * dy);
+      const steps = Math.max(1, Math.ceil(segLen / spacing));
+
+      for (let s = 1; s <= steps; s++) {
+        const t = s / steps;
+        result.push({ x: prev.x + dx * t, y: prev.y + dy * t });
+      }
+    }
+
+    return result;
+  }
+
+  function applyNormalizeSpacing() {
+    if (pathPoints.length < 2 || normalizeSpacing <= 0) return;
+
+    pushUndo();
+
+    const gtaPoints = pathPoints.map((p) => mapToGta(p.x, p.y));
+    const densified = densifyPoints(gtaPoints, normalizeSpacing);
+    pathPoints = densified.map((p) => gtaToMap(p.x, p.y));
+
+    closeNormalizeModal();
+    draw();
+  }
+
   function handleKeydown(e) {
     if (e.key === "Escape") {
       if (pickingIndex !== null) cancelPicking();
@@ -268,6 +341,7 @@
       else if (showImportPathModal) closeImportPathModal();
       else if (showExportModal) closeExportModal();
       else if (showClearConfirm) closeClearConfirm();
+      else if (showNormalizeModal) closeNormalizeModal();
       else if (showCalibrateModal) closeCalibrateModal();
       return;
     }
@@ -1208,6 +1282,42 @@
     </div>
   {/if}
 
+  {#if showNormalizeModal}
+    <div class="modal-backdrop" on:click={closeNormalizeModal}>
+      <div class="modal modal-sm" on:click|stopPropagation>
+        <div class="modal-header">
+          <i class="fa-solid fa-ruler-horizontal"></i>
+          <h3>Normalize Spacing</h3>
+        </div>
+
+        <p class="modal-message">
+          Adds extra points along any segment longer than the target spacing, so no gap between
+          points exceeds it. Existing points are never removed or moved — actual spacing may end
+          up shorter than the target in places. Useful if your in-game logic checks proximity to
+          the next point using a fixed distance.
+        </p>
+
+        <label class="normalize-field">
+          <span>Max spacing (GTA units)</span>
+          <input type="number" min="1" step="any" bind:value={normalizeSpacing} />
+        </label>
+
+        <p class="modal-message modal-message-faint">
+          Current path: {normalizeStats.count} points, spacing averages
+          {Math.round(normalizeStats.avg)} (min {Math.round(normalizeStats.min)}, max
+          {Math.round(normalizeStats.max)}).
+        </p>
+
+        <div class="modal-actions">
+          <button class="btn btn-primary" on:click={applyNormalizeSpacing}>
+            <i class="fa-solid fa-check"></i> Apply
+          </button>
+          <button class="btn btn-ghost" on:click={closeNormalizeModal}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if showCalibrateModal}
     <div class="modal-backdrop" on:click={closeCalibrateModal}>
       <div class="modal modal-lg" on:click|stopPropagation>
@@ -1587,6 +1697,11 @@
             Redo
           </button>
         </div>
+
+        <button class="btn btn-panel" on:click={openNormalizeModal} disabled={pathPoints.length < 2}>
+          <i class="fa-solid fa-ruler-horizontal"></i>
+          Normalize Spacing
+        </button>
 
         <button class="btn btn-panel btn-danger" on:click={openClearConfirm} disabled={pathPoints.length === 0}>
           <i class="fa-solid fa-trash"></i>
@@ -2306,6 +2421,36 @@
     font-size: 13px;
     line-height: 1.5;
     color: var(--text-dim);
+  }
+
+  .modal-message-faint {
+    font-size: 11px;
+    opacity: 0.7;
+  }
+
+  .normalize-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-faint);
+    margin: 14px 0;
+  }
+
+  .normalize-field input {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    padding: 7px 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .normalize-field input:focus {
+    border-color: var(--accent-border);
   }
 
   .calib-rows {
