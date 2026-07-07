@@ -41,9 +41,9 @@
   const MAP_SIZE = 8192;
 
   let mapOptions = [
-    { key: "map1", label: "Atlas", src: "/map.png" },
-    { key: "map2", label: "Roads", src: "/map2.jpg" },
-    { key: "map3", label: "Satellite", src: "/map3.jpg" }
+    { key: "map1", label: "Atlas", src: `${import.meta.env.BASE_URL}map.png` },
+    { key: "map2", label: "Roads", src: `${import.meta.env.BASE_URL}map2.jpg` },
+    { key: "map3", label: "Satellite", src: `${import.meta.env.BASE_URL}map3.jpg` }
   ];
 
   let currentMap = mapOptions[0].src;
