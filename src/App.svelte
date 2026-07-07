@@ -50,11 +50,14 @@
   let edgeColor = "#0c0f12";
   let mapWidth = MAP_SIZE;
   let mapHeight = MAP_SIZE;
+  let mapLoading = true;
   let customMapInputEl;
 
   // ===== UI =====
   let showImportModal = false;
   let importText = "";
+  let importFormat = "gate";
+  let importError = "";
   let importedCheckpoints = [];
 
   let showImportPathModal = false;
@@ -64,10 +67,20 @@
   let exportText = "";
 
   let showClearConfirm = false;
+  let showClearCheckpointsConfirm = false;
 
   let showNormalizeModal = false;
   let normalizeSpacing = 30;
   let normalizeStats = { count: 0, avg: 0, min: 0, max: 0 };
+
+  let showSimplifyModal = false;
+  let simplifyTolerance = 1;
+  let simplifyOriginalCount = 0;
+
+  let showSnapModal = false;
+  let snapSearchRadius = 20;
+  let snapColorTolerance = 40;
+  let snapping = false;
 
   let showMapMenu = false;
   let showColorMenu = false;
@@ -93,12 +106,28 @@
   let canvasEl;
   let ctx;
 
+  // centers the view on a hand-picked map location/zoom on load, instead of
+  // leaving the camera at its raw default (top-left corner, 10%)
+  function setDefaultView() {
+    const rect = viewportEl.getBoundingClientRect();
+
+    const centerX = 3782;
+    const centerY = 5933;
+    scale = 0.17;
+
+    pos = {
+      x: rect.width / 2 - centerX * scale,
+      y: rect.height / 2 - centerY * scale
+    };
+  }
+
   onMount(() => {
     preloadImages();
     loadMapMeta(currentMap);
 
     ctx = canvasEl.getContext("2d");
 
+    setDefaultView();
     draw(); // initial draw
 
     window.addEventListener("keydown", handleKeydown);
@@ -112,9 +141,53 @@
   function closeImportModal() {
     showImportModal = false;
     importText = "";
+    importError = "";
+  }
+
+  // pulls {x,y,z} out of a checkpoint entry regardless of whether it uses
+  // flat x/y/z fields, a nested coords object, or a pos object/array
+  function extractPointFields(entry) {
+    if (typeof entry.x === "number" && typeof entry.y === "number") {
+      return { x: entry.x, y: entry.y, z: typeof entry.z === "number" ? entry.z : 0 };
+    }
+
+    if (entry.coords) {
+      return {
+        x: entry.coords.x,
+        y: entry.coords.y,
+        z: typeof entry.coords.z === "number" ? entry.coords.z : 0
+      };
+    }
+
+    if (entry.pos) {
+      if (Array.isArray(entry.pos)) {
+        return { x: entry.pos[0], y: entry.pos[1], z: entry.pos[2] ?? 0 };
+      }
+      return {
+        x: entry.pos.x,
+        y: entry.pos.y,
+        z: typeof entry.pos.z === "number" ? entry.pos.z : 0
+      };
+    }
+
+    return null;
+  }
+
+  function extractRadius(entry) {
+    return typeof entry.radius === "number" ? entry.radius : null;
+  }
+
+  function looksLikeGate(entry) {
+    return !!(entry && entry.offset && entry.offset.left && entry.offset.right);
+  }
+
+  function looksLikePoint(entry) {
+    return !!(entry && extractPointFields(entry));
   }
 
   function handleImport() {
+    importError = "";
+
     try {
       let data = importText.trim();
 
@@ -131,7 +204,30 @@
         throw new Error("Expected array");
       }
 
-      importedCheckpoints = parsed;
+      const first = parsed[0];
+
+      if (importFormat === "gate" && !looksLikeGate(first) && looksLikePoint(first)) {
+        throw new Error('This looks like Single Point data, not Gate data — try switching the format above to "Single Point".');
+      }
+
+      if (importFormat === "point" && !looksLikePoint(first) && looksLikeGate(first)) {
+        throw new Error('This looks like Gate data, not Single Point data — try switching the format above to "Gate".');
+      }
+
+      if (importFormat === "point") {
+        importedCheckpoints = parsed.map((entry, i) => {
+          const point = extractPointFields(entry);
+
+          if (!point) {
+            throw new Error(`Could not read a position from checkpoint ${i + 1}`);
+          }
+
+          return { point, radius: extractRadius(entry) };
+        });
+      } else {
+        importedCheckpoints = parsed;
+      }
+
       draw();
       closeImportModal();
       // wait for DOM update so viewportEl is valid
@@ -141,7 +237,7 @@
 
     } catch (err) {
       console.error(err);
-      alert("Invalid checkpoint data");
+      importError = err.message || "Invalid checkpoint data";
     }
   }
 
@@ -265,6 +361,27 @@
     showClearConfirm = false;
   }
 
+  function clearCheckpoints() {
+    if (importedCheckpoints.length === 0) return;
+
+    importedCheckpoints = [];
+    draw();
+  }
+
+  function openClearCheckpointsConfirm() {
+    if (importedCheckpoints.length === 0) return;
+    showClearCheckpointsConfirm = true;
+  }
+
+  function closeClearCheckpointsConfirm() {
+    showClearCheckpointsConfirm = false;
+  }
+
+  function confirmClearCheckpoints() {
+    clearCheckpoints();
+    showClearCheckpointsConfirm = false;
+  }
+
   // ================= NORMALIZE SPACING =================
   function computePathStats(points) {
     if (points.length < 2) return { count: points.length, avg: 0, min: 0, max: 0 };
@@ -334,6 +451,195 @@
     draw();
   }
 
+  // ================= SIMPLIFY PATH =================
+  function perpendicularDistance(point, lineStart, lineEnd) {
+    const dx = lineEnd.x - lineStart.x;
+    const dy = lineEnd.y - lineStart.y;
+    const lenSq = dx * dx + dy * dy;
+
+    if (lenSq === 0) {
+      const ddx = point.x - lineStart.x;
+      const ddy = point.y - lineStart.y;
+      return Math.sqrt(ddx * ddx + ddy * ddy);
+    }
+
+    const t = ((point.x - lineStart.x) * dx + (point.y - lineStart.y) * dy) / lenSq;
+    const projX = lineStart.x + t * dx;
+    const projY = lineStart.y + t * dy;
+    const ddx = point.x - projX;
+    const ddy = point.y - projY;
+
+    return Math.sqrt(ddx * ddx + ddy * ddy);
+  }
+
+  // Ramer-Douglas-Peucker: drops points that sit within `tolerance` of the
+  // straight line between their neighbors, keeping the shape within that
+  // tolerance; points are only ever removed, never added or moved
+  function simplifyPoints(points, tolerance) {
+    if (points.length < 3 || tolerance <= 0) return points;
+
+    let maxDist = 0;
+    let maxIndex = 0;
+    const first = points[0];
+    const last = points[points.length - 1];
+
+    for (let i = 1; i < points.length - 1; i++) {
+      const dist = perpendicularDistance(points[i], first, last);
+      if (dist > maxDist) {
+        maxDist = dist;
+        maxIndex = i;
+      }
+    }
+
+    if (maxDist > tolerance) {
+      const left = simplifyPoints(points.slice(0, maxIndex + 1), tolerance);
+      const right = simplifyPoints(points.slice(maxIndex), tolerance);
+      return left.slice(0, -1).concat(right);
+    }
+
+    return [first, last];
+  }
+
+  function openSimplifyModal() {
+    if (pathPoints.length < 3) return;
+
+    simplifyOriginalCount = pathPoints.length;
+    showSimplifyModal = true;
+  }
+
+  function closeSimplifyModal() {
+    showSimplifyModal = false;
+  }
+
+  function applySimplifyPath() {
+    if (pathPoints.length < 3 || simplifyTolerance <= 0) return;
+
+    pushUndo();
+
+    const gtaPoints = pathPoints.map((p) => mapToGta(p.x, p.y));
+    const simplified = simplifyPoints(gtaPoints, simplifyTolerance);
+    pathPoints = simplified.map((p) => gtaToMap(p.x, p.y));
+
+    closeSimplifyModal();
+    draw();
+  }
+
+  $: simplifyPreviewCount = showSimplifyModal
+    ? simplifyPoints(pathPoints.map((p) => mapToGta(p.x, p.y)), simplifyTolerance).length
+    : pathPoints.length;
+
+  // ================= SNAP TO ROAD =================
+  function loadImageElement(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+    });
+  }
+
+  // draws the current map at native resolution onto an offscreen canvas once,
+  // returning a sampler function so per-pixel color lookups stay cheap
+  async function getMapPixelSampler() {
+    const img = await loadImageElement(currentMap);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = mapWidth;
+    canvas.height = mapHeight;
+
+    const sampleCtx = canvas.getContext("2d");
+    sampleCtx.drawImage(img, 0, 0, mapWidth, mapHeight);
+
+    return (x, y) => {
+      const px = Math.min(Math.max(Math.round(x), 0), mapWidth - 1);
+      const py = Math.min(Math.max(Math.round(y), 0), mapHeight - 1);
+      return sampleCtx.getImageData(px, py, 1, 1).data;
+    };
+  }
+
+  function colorDistance(a, b) {
+    const dr = a[0] - b[0];
+    const dg = a[1] - b[1];
+    const db = a[2] - b[2];
+    return Math.sqrt(dr * dr + dg * dg + db * db);
+  }
+
+  function computeTangent(points, i) {
+    const prev = points[Math.max(i - 1, 0)];
+    const next = points[Math.min(i + 1, points.length - 1)];
+    const dx = next.x - prev.x;
+    const dy = next.y - prev.y;
+    const len = Math.sqrt(dx * dx + dy * dy);
+
+    return len > 0 ? { x: dx / len, y: dy / len } : { x: 1, y: 0 };
+  }
+
+  // walks perpendicular to the path's local direction on both sides of a
+  // point, looking for where the pixel color stops matching the color at the
+  // point itself; if both edges are found, the point is moved to sit midway
+  // between them. Points with no clear edge within the search radius (e.g.
+  // already off the road) are left untouched
+  function snapPointToRoadCenter(point, tangent, sample, searchRadius, tolerance) {
+    const perp = { x: -tangent.y, y: tangent.x };
+    const reference = sample(point.x, point.y);
+
+    let posEdge = null;
+    for (let d = 1; d <= searchRadius; d++) {
+      const color = sample(point.x + perp.x * d, point.y + perp.y * d);
+      if (colorDistance(color, reference) > tolerance) {
+        posEdge = d - 1;
+        break;
+      }
+    }
+
+    let negEdge = null;
+    for (let d = 1; d <= searchRadius; d++) {
+      const color = sample(point.x - perp.x * d, point.y - perp.y * d);
+      if (colorDistance(color, reference) > tolerance) {
+        negEdge = d - 1;
+        break;
+      }
+    }
+
+    if (posEdge === null || negEdge === null) return point;
+
+    const offset = (posEdge - negEdge) / 2;
+
+    return { x: point.x + perp.x * offset, y: point.y + perp.y * offset };
+  }
+
+  function openSnapModal() {
+    if (pathPoints.length < 2) return;
+    showSnapModal = true;
+  }
+
+  function closeSnapModal() {
+    if (snapping) return;
+    showSnapModal = false;
+  }
+
+  async function applySnapToRoad() {
+    if (pathPoints.length < 2 || snapping) return;
+
+    snapping = true;
+
+    try {
+      const sample = await getMapPixelSampler();
+
+      const snapped = pathPoints.map((point, i) => {
+        const tangent = computeTangent(pathPoints, i);
+        return snapPointToRoadCenter(point, tangent, sample, snapSearchRadius, snapColorTolerance);
+      });
+
+      pushUndo();
+      pathPoints = snapped;
+      closeSnapModal();
+      draw();
+    } finally {
+      snapping = false;
+    }
+  }
+
   function handleKeydown(e) {
     if (e.key === "Escape") {
       if (pickingIndex !== null) cancelPicking();
@@ -341,7 +647,10 @@
       else if (showImportPathModal) closeImportPathModal();
       else if (showExportModal) closeExportModal();
       else if (showClearConfirm) closeClearConfirm();
+      else if (showClearCheckpointsConfirm) closeClearCheckpointsConfirm();
       else if (showNormalizeModal) closeNormalizeModal();
+      else if (showSimplifyModal) closeSimplifyModal();
+      else if (showSnapModal) closeSnapModal();
       else if (showCalibrateModal) closeCalibrateModal();
       return;
     }
@@ -649,6 +958,8 @@
   // reads the map image's natural size (so non-square custom uploads render
   // undistorted) and samples its outer border for the edge-fill color
   function loadMapMeta(src) {
+    mapLoading = true;
+
     const img = new Image();
 
     img.onload = () => {
@@ -683,6 +994,13 @@
       b = Math.round(b / points.length);
 
       edgeColor = `rgb(${r}, ${g}, ${b})`;
+
+      // padding so the overlay always outlasts the actual load/paint work
+      setTimeout(() => { mapLoading = false; }, 300);
+    };
+
+    img.onerror = () => {
+      mapLoading = false;
     };
 
     img.src = src;
@@ -725,6 +1043,19 @@
     };
   }
 
+  // a checkpoint is either a gate ({offset:{left,right}}) or a single point
+  // ({point, radius}); this returns its map-pixel point(s) either way
+  function getCheckpointMapPoints(cp) {
+    if (cp.offset) {
+      return [
+        gtaToMap(cp.offset.left.x, cp.offset.left.y),
+        gtaToMap(cp.offset.right.x, cp.offset.right.y)
+      ];
+    }
+
+    return [gtaToMap(cp.point.x, cp.point.y)];
+  }
+
   function getCheckpointBounds(checkpoints) {
     let minX = Infinity;
     let minY = Infinity;
@@ -732,13 +1063,12 @@
     let maxY = -Infinity;
 
     for (const cp of checkpoints) {
-      const l = gtaToMap(cp.offset.left.x, cp.offset.left.y);
-      const r = gtaToMap(cp.offset.right.x, cp.offset.right.y);
-
-      minX = Math.min(minX, l.x, r.x);
-      minY = Math.min(minY, l.y, r.y);
-      maxX = Math.max(maxX, l.x, r.x);
-      maxY = Math.max(maxY, l.y, r.y);
+      for (const p of getCheckpointMapPoints(cp)) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
     }
 
     return { minX, minY, maxX, maxY };
@@ -793,8 +1123,7 @@
     const points = [...pathPoints];
 
     for (const cp of importedCheckpoints) {
-      points.push(gtaToMap(cp.offset.left.x, cp.offset.left.y));
-      points.push(gtaToMap(cp.offset.right.x, cp.offset.right.y));
+      points.push(...getCheckpointMapPoints(cp));
     }
 
     if (points.length === 0) return;
@@ -1058,6 +1387,11 @@
   }
 
   function drawCheckpoint(cp, i) {
+    if (cp.point) {
+      drawPointCheckpoint(cp, i);
+      return;
+    }
+
     const r = getCheckpointRender(cp);
 
     // gate
@@ -1083,6 +1417,28 @@
 
     // label
     drawText(i + 1, r.cx, r.cy + 35);
+  }
+
+  // single-point checkpoints (no left/right pair to draw a gate from) render
+  // as a semi-transparent bubble sized to match the source radius, if given
+  function drawPointCheckpoint(cp, i) {
+    const center = gtaToMap(cp.point.x, cp.point.y);
+
+    const avgScale = (Math.abs(transform.scaleX) + Math.abs(transform.scaleY)) / 2;
+    const radius = cp.radius ? Math.max(4, cp.radius * avgScale) : 10;
+
+    ctx.beginPath();
+    ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = hueToColor(checkpointHue);
+    ctx.globalAlpha = 0.35;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = hueToColor(checkpointHue);
+    ctx.stroke();
+
+    drawText(i + 1, center.x, center.y + radius + 16);
   }
 
   function drawCircle(x, y, r) {
@@ -1207,7 +1563,40 @@
           <h3>Import Checkpoints</h3>
         </div>
 
+        <div class="format-toggle">
+          <button
+            class="format-toggle-btn"
+            class:active={importFormat === "gate"}
+            on:click={() => { importFormat = "gate"; importError = ""; }}
+          >
+            Gate
+          </button>
+          <button
+            class="format-toggle-btn"
+            class:active={importFormat === "point"}
+            on:click={() => { importFormat = "point"; importError = ""; }}
+          >
+            Single Point
+          </button>
+        </div>
+
+        {#if importFormat === "gate"}
+          <p class="modal-message modal-message-faint">
+            Expects each entry to have an offset object with left/right x/y pairs — a gate line
+            between two side points.
+          </p>
+        {:else}
+          <p class="modal-message modal-message-faint">
+            Accepts flat x/y/z fields, a nested coords object, or a pos object/array per entry,
+            with an optional radius field.
+          </p>
+        {/if}
+
         <textarea bind:value={importText} placeholder="Paste checkpoint JSON here..."></textarea>
+
+        {#if importError}
+          <p class="modal-message modal-error">{importError}</p>
+        {/if}
 
         <div class="modal-actions">
           <button class="btn btn-primary" on:click={handleImport}>
@@ -1282,6 +1671,29 @@
     </div>
   {/if}
 
+  {#if showClearCheckpointsConfirm}
+    <div class="modal-backdrop" on:click={closeClearCheckpointsConfirm}>
+      <div class="modal modal-sm" on:click|stopPropagation>
+        <div class="modal-header modal-header-danger">
+          <i class="fa-solid fa-trash"></i>
+          <h3>Clear Checkpoints</h3>
+        </div>
+
+        <p class="modal-message">
+          This removes all {importedCheckpoints.length} imported checkpoint{importedCheckpoints.length === 1 ? "" : "s"}.
+          You'll need to re-import the JSON if you want them back.
+        </p>
+
+        <div class="modal-actions">
+          <button class="btn btn-danger-solid" on:click={confirmClearCheckpoints}>
+            <i class="fa-solid fa-trash"></i> Clear
+          </button>
+          <button class="btn btn-ghost" on:click={closeClearCheckpointsConfirm}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if showNormalizeModal}
     <div class="modal-backdrop" on:click={closeNormalizeModal}>
       <div class="modal modal-sm" on:click|stopPropagation>
@@ -1297,14 +1709,14 @@
           the next point using a fixed distance.
         </p>
 
-        <label class="normalize-field">
+        <label class="modal-field">
           <span>Max spacing (GTA units)</span>
           <input type="number" min="1" step="any" bind:value={normalizeSpacing} />
         </label>
 
         <p class="modal-message modal-message-faint">
           Current path: {normalizeStats.count} points, spacing averages
-          {Math.round(normalizeStats.avg)} (min {Math.round(normalizeStats.min)}, max
+          <span class="accent-text">{Math.round(normalizeStats.avg)}</span> (min {Math.round(normalizeStats.min)}, max
           {Math.round(normalizeStats.max)}).
         </p>
 
@@ -1313,6 +1725,75 @@
             <i class="fa-solid fa-check"></i> Apply
           </button>
           <button class="btn btn-ghost" on:click={closeNormalizeModal}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if showSimplifyModal}
+    <div class="modal-backdrop" on:click={closeSimplifyModal}>
+      <div class="modal modal-sm" on:click|stopPropagation>
+        <div class="modal-header">
+          <i class="fa-solid fa-compress"></i>
+          <h3>Simplify Path</h3>
+        </div>
+
+        <p class="modal-message">
+          Removes points that don't meaningfully change the path's shape — useful for cleaning up
+          a route imported from recorded telemetry or drawn with a shaky hand. Points are only
+          removed, never added or moved.
+        </p>
+
+        <label class="modal-field">
+          <span>Tolerance (GTA units)</span>
+          <input type="number" min="0.1" step="any" bind:value={simplifyTolerance} />
+        </label>
+
+        <p class="modal-message modal-message-faint">
+          This would reduce <span class="accent-text">{simplifyOriginalCount}</span> points to
+          <span class="accent-text">{simplifyPreviewCount}</span>.
+        </p>
+
+        <div class="modal-actions">
+          <button class="btn btn-primary" on:click={applySimplifyPath}>
+            <i class="fa-solid fa-check"></i> Apply
+          </button>
+          <button class="btn btn-ghost" on:click={closeSimplifyModal}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if showSnapModal}
+    <div class="modal-backdrop" on:click={closeSnapModal}>
+      <div class="modal modal-sm" on:click|stopPropagation>
+        <div class="modal-header">
+          <i class="fa-solid fa-road"></i>
+          <h3>Snap to Road</h3>
+        </div>
+
+        <p class="modal-message">
+          Reads the map image's pixels around each point and nudges it to sit centered between
+          the road edges, based on color similarity to whatever the point currently sits on.
+          Points with no clear edge nearby (already off the road) are left untouched.
+        </p>
+
+        <label class="modal-field">
+          <span>Search radius (px)</span>
+          <input type="number" min="1" step="1" bind:value={snapSearchRadius} />
+        </label>
+
+        <label class="modal-field">
+          <span>Color tolerance</span>
+          <input type="number" min="1" step="1" bind:value={snapColorTolerance} />
+        </label>
+
+        <div class="modal-actions">
+          <button class="btn btn-primary" on:click={applySnapToRoad} disabled={snapping}>
+            <i class="fa-solid {snapping ? 'fa-spinner fa-spin' : 'fa-check'}"></i>
+            {snapping ? "Snapping..." : "Apply"}
+          </button>
+          <button class="btn btn-ghost" on:click={closeSnapModal} disabled={snapping}>Cancel</button>
         </div>
       </div>
     </div>
@@ -1416,6 +1897,17 @@
         <p>Custom Routing Tool</p>
       </div>
     </div>
+
+    <a
+      class="icon-btn github-link"
+      href="https://github.com/Lucidkniight/fivem-gps-editor"
+      target="_blank"
+      rel="noopener noreferrer"
+      title="View on GitHub"
+    >
+      <i class="fa-brands fa-github"></i>
+      <span>GitHub</span>
+    </a>
   </header>
 
   <div class="workspace">
@@ -1660,6 +2152,12 @@
 
         </div>
       </div>
+
+      {#if mapLoading}
+        <div class="map-loading">
+          <div class="spinner"></div>
+        </div>
+      {/if}
     </div>
 
     <!-- ===== SIDEBAR ===== -->
@@ -1677,7 +2175,7 @@
             <span class="stat-value">{pathPoints.length}</span>
           </div>
           <div class="stat-tile">
-            <span class="stat-label">Gates</span>
+            <span class="stat-label">CPs</span>
             <span class="stat-value">{importedCheckpoints.length}</span>
           </div>
         </div>
@@ -1703,6 +2201,43 @@
           Normalize Spacing
         </button>
 
+        <button class="btn btn-panel" on:click={openSimplifyModal} disabled={pathPoints.length < 3}>
+          <i class="fa-solid fa-compress"></i>
+          Simplify Path
+        </button>
+
+        <button class="btn btn-panel" on:click={openSnapModal} disabled={pathPoints.length < 2}>
+          <i class="fa-solid fa-road"></i>
+          Snap to Road
+        </button>
+      </section>
+
+      <section class="panel-section">
+        <h2 class="section-title">Checkpoints</h2>
+
+        <button class="btn btn-panel" on:click={openImportModal}>
+          <i class="fa-solid fa-file-import"></i>
+          Import Checkpoints
+        </button>
+
+        <button
+          class="btn btn-panel btn-danger"
+          on:click={openClearCheckpointsConfirm}
+          disabled={importedCheckpoints.length === 0}
+        >
+          <i class="fa-solid fa-trash"></i>
+          Clear Checkpoints
+        </button>
+      </section>
+
+      <section class="panel-section">
+        <h2 class="section-title">Path</h2>
+
+        <button class="btn btn-panel" on:click={openImportPathModal}>
+          <i class="fa-solid fa-route"></i>
+          Import Path
+        </button>
+
         <button class="btn btn-panel btn-danger" on:click={openClearConfirm} disabled={pathPoints.length === 0}>
           <i class="fa-solid fa-trash"></i>
           Clear Path
@@ -1710,17 +2245,7 @@
       </section>
 
       <section class="panel-section">
-        <h2 class="section-title">Data</h2>
-
-        <button class="btn btn-panel" on:click={openImportModal}>
-          <i class="fa-solid fa-file-import"></i>
-          Import Checkpoints
-        </button>
-
-        <button class="btn btn-panel" on:click={openImportPathModal}>
-          <i class="fa-solid fa-route"></i>
-          Import Path
-        </button>
+        <h2 class="section-title">Export</h2>
 
         <button class="btn btn-panel" on:click={openExportModal} disabled={pathPoints.length === 0}>
           <i class="fa-solid fa-file-export"></i>
@@ -1754,6 +2279,20 @@
     background: var(--bg-panel);
     border-bottom: 1px solid var(--border);
     position: relative;
+  }
+
+  .icon-btn.github-link {
+    margin-left: auto;
+    width: auto;
+    height: 36px;
+    padding: 0 14px;
+    gap: 8px;
+    display: flex;
+    align-items: center;
+    text-decoration: none;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 500;
   }
 
   .topbar::after {
@@ -1838,6 +2377,30 @@
     right: 14px;
     border-bottom: 1.5px solid var(--accent);
     border-right: 1.5px solid var(--accent);
+  }
+
+  .map-loading {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    display: grid;
+    place-items: center;
+    background: #000;
+  }
+
+  .spinner {
+    width: 48px;
+    height: 48px;
+    border: 4px solid rgba(242, 182, 50, 0.2);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   .viewport {
@@ -2265,11 +2828,14 @@
   }
 
   .section-title {
+    display: inline-block;
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.8px;
-    color: var(--text-faint);
+    color: var(--accent);
+    padding-bottom: 4px;
+    border-bottom: 2px solid var(--border);
   }
 
   .stat-grid {
@@ -2428,7 +2994,47 @@
     opacity: 0.7;
   }
 
-  .normalize-field {
+  .modal-error {
+    color: var(--danger);
+  }
+
+  .accent-text {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .format-toggle {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .format-toggle-btn {
+    flex: 1;
+    padding: 8px 12px;
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-dim);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+  }
+
+  .format-toggle-btn:hover {
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
+
+  .format-toggle-btn.active {
+    background: var(--accent-soft);
+    border-color: var(--accent-border);
+    color: var(--accent);
+  }
+
+  .modal-field {
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -2439,7 +3045,7 @@
     margin: 14px 0;
   }
 
-  .normalize-field input {
+  .modal-field input {
     background: var(--bg-panel);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -2449,7 +3055,7 @@
     font-size: 12px;
   }
 
-  .normalize-field input:focus {
+  .modal-field input:focus {
     border-color: var(--accent-border);
   }
 
