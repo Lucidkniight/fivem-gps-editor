@@ -1,5 +1,7 @@
 <script>
   import { onMount } from "svelte";
+  import exampleCheckpoints from "@assets/example-checkpoints.json";
+  import examplePath from "@assets/example-path.json";
 
   let activeTool = "none";
 
@@ -144,6 +146,12 @@
     importError = "";
   }
 
+  function loadExampleCheckpoints() {
+    importFormat = "gate";
+    importText = JSON.stringify(exampleCheckpoints);
+    handleImport();
+  }
+
   // pulls {x,y,z} out of a checkpoint entry regardless of whether it uses
   // flat x/y/z fields, a nested coords object, or a pos object/array
   function extractPointFields(entry) {
@@ -249,6 +257,11 @@
   function closeImportPathModal() {
     showImportPathModal = false;
     importPathText = "";
+  }
+
+  function loadExamplePath() {
+    importPathText = JSON.stringify(examplePath);
+    handleImportPath();
   }
 
   function handleImportPath() {
@@ -1592,6 +1605,10 @@
           </p>
         {/if}
 
+        <button class="btn btn-ghost modal-example-btn" on:click={loadExampleCheckpoints}>
+          <i class="fa-solid fa-flask"></i> Load Example Data
+        </button>
+
         <textarea bind:value={importText} placeholder="Paste checkpoint JSON here..."></textarea>
 
         {#if importError}
@@ -1615,6 +1632,10 @@
           <i class="fa-solid fa-route"></i>
           <h3>Import Path</h3>
         </div>
+
+        <button class="btn btn-ghost modal-example-btn" on:click={loadExamplePath}>
+          <i class="fa-solid fa-flask"></i> Load Example Data
+        </button>
 
         <textarea bind:value={importPathText} placeholder="Paste path JSON here..."></textarea>
 
@@ -2996,6 +3017,10 @@
 
   .modal-error {
     color: var(--danger);
+  }
+
+  .modal-example-btn {
+    margin-bottom: 14px;
   }
 
   .accent-text {
